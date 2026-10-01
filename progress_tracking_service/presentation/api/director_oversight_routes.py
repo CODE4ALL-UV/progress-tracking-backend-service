@@ -12,6 +12,10 @@ Responde a tres preguntas distintas, y conviene no mezclarlas:
 Todo esto es solo para el director. Y el rol se comprueba contra la base de
 datos, no contra el token: a alguien que deja de ser director se le corta el
 acceso en el momento, sin esperar a que caduque su sesión.
+
+Cada docente tiene sus propios cursos, así que la revisión del contenido es de
+una sección **de un curso**: aprobar la versión de un docente no dice nada de
+la misma sección en el curso de otro.
 """
 
 from datetime import datetime, timezone
@@ -24,8 +28,11 @@ from sqlalchemy.orm import Session
 
 from user_management_service.core.security import decode_access_token
 from neon_storage import get_db
+from neon_storage.courses import general_course
 from neon_storage.models import (
     ContentReview,
+    Course,
+    CourseEnrollment,
     CourseOverride,
     TeacherReview,
     Usuario,
@@ -112,6 +119,14 @@ def teachers(db: Session = Depends(get_db), _director: Usuario = Depends(require
         .all()
     )
 
+    courses = dict(
+        (row.teacher_id, int(row.total or 0))
+        for row in db.query(Course.teacher_id, func.count(Course.id).label("total"))
+        .filter(Course.is_general.is_(False))
+        .group_by(Course.teacher_id)
+        .all()
+    )
+
     out = []
     for docente in docentes:
         mine = edits.get(docente.correo)
@@ -131,6 +146,7 @@ def teachers(db: Session = Depends(get_db), _director: Usuario = Depends(require
                 "correo": docente.correo,
                 "edits": mine[0] if mine else 0,
                 "last_edit": _iso(mine[1]) if mine else None,
+                "courses": courses.get(docente.id_usuario, 0),
                 "reviews": len(reviews),
                 "last_score": scores[0] if scores else None,
                 "avg_score": round(sum(scores) / len(scores), 2) if scores else None,
@@ -165,18 +181,24 @@ def teacher_activity(
         .all()
     )
 
-    # El estado de revisión de cada sección que tocó, para ver de un vistazo
-    # qué le falta por aprobar.
+    # El estado de revisión de cada sección que tocó, en el curso donde la
+    # tocó, para ver de un vistazo qué le falta por aprobar.
     reviews = dict(
-        (row.section_id, row)
+        ((row.course_id, row.section_id), row)
         for row in db.query(ContentReview)
         .filter(ContentReview.section_id.in_([r.target_id for r in rows] or [""]))
+        .all()
+    )
+    titles = dict(
+        (course.id, course.title)
+        for course in db.query(Course)
+        .filter(Course.id.in_({r.course_id for r in rows if r.course_id} or {0}))
         .all()
     )
 
     items = []
     for row in rows:
-        review = reviews.get(row.target_id)
+        review = reviews.get((row.course_id, row.target_id))
 
         # Una revisión anterior al último cambio ya no dice nada del contenido
         # que hay ahora. Vale más avisarlo que dejar un "aprobado" engañoso.
@@ -189,6 +211,8 @@ def teacher_activity(
 
         items.append(
             {
+                "course_id": row.course_id,
+                "course_title": titles.get(row.course_id),
                 "scope": row.scope,
                 "target_id": row.target_id,
                 "updated_at": _iso(row.updated_at),
@@ -298,6 +322,20 @@ class ContentReviewIn(BaseModel):
     section_id: str
     status: str
     comment: str = ""
+    # De qué curso es la sección. Sin él, del Curso general, como antes.
+    course_id: Optional[int] = None
+
+
+def _course_or_general(db: Session, course_id: Optional[int]) -> Course:
+    if course_id is None:
+        return general_course(db)
+    course = db.query(Course).filter(Course.id == course_id).first()
+    if course is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese curso no existe.",
+        )
+    return course
 
 
 @router.put("/content/{section_id}")
@@ -325,15 +363,20 @@ def review_content(
             detail="Si pones observaciones, explica cuáles.",
         )
 
+    course = _course_or_general(db, payload.course_id)
     row = (
         db.query(ContentReview)
-        .filter(ContentReview.section_id == section_id)
+        .filter(
+            ContentReview.course_id == course.id,
+            ContentReview.section_id == section_id,
+        )
         .first()
     )
     now = datetime.now(timezone.utc)
 
     if row is None:
         row = ContentReview(
+            course_id=course.id,
             section_id=section_id,
             status=payload.status,
             comment=payload.comment.strip()[:4000],
@@ -351,6 +394,7 @@ def review_content(
     db.refresh(row)
 
     return {
+        "course_id": row.course_id,
         "section_id": row.section_id,
         "status": row.status,
         "comment": row.comment,
@@ -366,10 +410,10 @@ def content_reviews(
     """Todas las revisiones de contenido, con aviso de cuáles se quedaron viejas."""
     rows = db.query(ContentReview).all()
 
-    # Cuándo se tocó por última vez cada sección, para detectar revisiones que
-    # el docente ya dejó atrás.
+    # Cuándo se tocó por última vez cada sección en cada curso, para detectar
+    # revisiones que el docente ya dejó atrás.
     edits = dict(
-        (row.target_id, row.updated_at)
+        ((row.course_id, row.target_id), row.updated_at)
         for row in db.query(CourseOverride)
         .filter(CourseOverride.scope == "section")
         .all()
@@ -377,11 +421,12 @@ def content_reviews(
 
     items = []
     for row in rows:
-        edited_at = edits.get(row.section_id)
+        edited_at = edits.get((row.course_id, row.section_id))
         stale = bool(edited_at and row.reviewed_at and row.reviewed_at < edited_at)
 
         items.append(
             {
+                "course_id": row.course_id,
                 "section_id": row.section_id,
                 "status": row.status,
                 "comment": row.comment,
@@ -391,3 +436,70 @@ def content_reviews(
         )
 
     return {"count": len(items), "items": items}
+
+
+# --- los cursos de cada docente ---------------------------------------------
+
+
+@router.get("/courses")
+def courses(
+    db: Session = Depends(get_db),
+    _director: Usuario = Depends(require_director),
+):
+    """Todos los cursos, con su docente, sus estudiantes y lo que se editó.
+
+    Es lo que la dirección necesita para revisar el contenido curso por curso:
+    qué secciones cambió cada docente en cada uno de sus cursos.
+    """
+    general = general_course(db)
+    rows = db.query(Course).order_by(Course.is_general.desc(), Course.created_at).all()
+
+    teachers = dict(
+        (user.id_usuario, user.nombre)
+        for user in db.query(Usuario)
+        .filter(Usuario.id_usuario.in_({c.teacher_id for c in rows if c.teacher_id} or {0}))
+        .all()
+    )
+    enrolled = dict(
+        (row.course_id, int(row.total or 0))
+        for row in db.query(
+            CourseEnrollment.course_id, func.count(CourseEnrollment.id).label("total")
+        )
+        .group_by(CourseEnrollment.course_id)
+        .all()
+    )
+    all_students = (
+        db.query(func.count(Usuario.id_usuario))
+        .filter(func.lower(Usuario.rol) == "estudiante")
+        .scalar()
+        or 0
+    )
+
+    edited: dict[int, list] = {}
+    for row in (
+        db.query(CourseOverride)
+        .filter(CourseOverride.scope == "section")
+        .order_by(CourseOverride.updated_at.desc())
+        .all()
+    ):
+        edited.setdefault(row.course_id, []).append(
+            {"section_id": row.target_id, "updated_at": _iso(row.updated_at)}
+        )
+
+    items = [
+        {
+            "id": course.id,
+            "title": course.title,
+            "is_general": bool(course.is_general),
+            "teacher": (
+                {"id": course.teacher_id, "nombre": teachers.get(course.teacher_id, "")}
+                if course.teacher_id
+                else None
+            ),
+            "students": all_students if course.id == general.id else enrolled.get(course.id, 0),
+            "edited_sections": edited.get(course.id, []),
+        }
+        for course in rows
+    ]
+
+    return {"count": len(items), "courses": items}
