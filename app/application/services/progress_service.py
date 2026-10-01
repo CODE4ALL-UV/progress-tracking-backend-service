@@ -1,1 +1,0 @@
-# progress tracking service for managing user progress in activities and tasks

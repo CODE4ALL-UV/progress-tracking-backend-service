@@ -1,1 +1,0 @@
-# accessibility_profile.py sirve para definir la clase AccessibilityProfile, que representa un perfil de accesibilidad para una persona con discapacidad. Esta clase tiene atributos como el tipo de discapacidad, las necesidades específicas y las adaptaciones requeridas. Además, puede incluir métodos para validar la información y generar recomendaciones de accesibilidad.

@@ -1,1 +1,0 @@
-# progress tracking data transfer object for transferring progress data between layers of the application

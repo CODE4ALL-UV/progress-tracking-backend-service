@@ -1,1 +1,0 @@
-# progress repository implementation for managing progress data in the database
