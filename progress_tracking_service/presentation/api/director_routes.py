@@ -29,8 +29,9 @@ def _require_director(authorization: str | None = Header(None), db: Session = De
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
 
-    user_id = int(payload.get("sub")) if payload.get("sub") else None
-    if not user_id:
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token sin usuario")
 
     repo = PerformanceRepository(db)

@@ -87,6 +87,16 @@ def test_a_token_that_names_nobody_does_not_open_the_panel():
     assert response.json()["detail"] == "Token sin usuario"
 
 
+def test_a_token_whose_user_is_not_a_number_does_not_open_the_panel():
+    # Bien firmado, pero el sub no es un id: antes era un 500.
+    headers = _bearer({"sub": "director", "email": "director@example.com", "rol": "director"})
+
+    response = client.get("/api/director/students", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Token sin usuario"
+
+
 def test_a_token_role_is_not_enough_without_the_account():
     # El token dice director, pero esa cuenta no existe en la base.
     headers = _bearer({"sub": "987654321", "email": "nadie@example.com", "rol": "director"})
